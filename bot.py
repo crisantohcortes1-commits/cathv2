@@ -1266,44 +1266,114 @@ def parse_test(message):
         f"Time: {parsed_dt.strftime('%I:%M %p')}\n"
         f"Task: {task}"
     )
+# ==========================================
+# Pending upload state (in-memory)
+# ==========================================
+pending_uploads = {}
+pending_lock = threading.Lock()
+PENDING_TIMEOUT = 60
+
+def set_pending(chat_id, title):
+    with pending_lock:
+        pending_uploads[chat_id] = {
+            "title": title,
+            "collected": [],
+            "expires": time.time() + PENDING_TIMEOUT
+        }
+
+def get_pending(chat_id):
+    with pending_lock:
+        p = pending_uploads.get(chat_id)
+        if p and time.time() < p["expires"]:
+            return p
+        if p:
+            del pending_uploads[chat_id]
+        return None
+
+def clear_pending(chat_id):
+    with pending_lock:
+        pending_uploads.pop(chat_id, None)
+
 
 # ==========================================
-# 27. /upload (supports photos, documents, and plain text notes)
+# 27. /upload — Step 1: ask for photos
 # ==========================================
-@bot.message_handler(commands=['upload'], content_types=['text', 'document', 'photo'])
-def handle_upload(message):
-    if message.content_type in ('document', 'photo') and message.caption:
-        args = message.caption.split(maxsplit=1)
-    else:
-        args = message.text.split(maxsplit=1) if message.text else []
-    if len(args) < 2:
-        bot.reply_to(message, "⚠️ Use: /upload [title] together with a photo, file, or text.\nExample: caption a photo with '/upload math'")
+@bot.message_handler(commands=['upload'])
+def handle_upload_command(message):
+    args = message.text.split(maxsplit=1)
+    if len(args) < 2 or not args[1].strip():
+        bot.reply_to(message, "⚠️ Use: /upload [title]\nExample: /upload math")
         return
+
     title = args[1].lower().strip()
-    db = load_db()
+    set_pending(message.chat.id, title)
+    bot.reply_to(
+        message,
+        f"📎 Ready to save under *'{title}'*.\n"
+        f"Send your photo(s) now, then /donesaving when finished.",
+        parse_mode="Markdown"
+    )
+
+
+# ==========================================
+# 27A. Photo handler — Step 2: receive photos
+# ==========================================
+@bot.message_handler(content_types=['photo'])
+def handle_photo(message):
     chat_id = message.chat.id
-    record: dict = {
+    pending = get_pending(chat_id)
+    if not pending:
+        return
+
+    title = pending["title"]
+    db = load_db()
+    record = {
         "id": int(time.time() * 1000),
         "title": title,
         "chat_id": chat_id,
+        "type": "photo",
+        "file_id": message.photo[-1].file_id,
     }
-    if message.content_type == 'photo':
-        record["type"] = "photo"
-        record["file_id"] = message.photo[-1].file_id
-    elif message.content_type == 'document':
-        record["type"] = "file"
-        record["file_id"] = message.document.file_id
-        record["file_name"] = message.document.file_name
-    else:
-        record["type"] = "text"
-        record["content"] = args[1].strip()
     db["notes"].append(record)
     save_db(db)
-    kind_label = {"photo": "photo", "file": "file", "text": "note"}[record["type"]]
-    bot.reply_to(message, f"✅ Saved {kind_label} under '{title}'.\nID: {record['id']}\nUse /deleteupload id:{record['id']} to remove it.")
+
+    with pending_lock:
+        if chat_id in pending_uploads:
+            pending_uploads[chat_id]["collected"].append(record["id"])
+            pending_uploads[chat_id]["expires"] = time.time() + PENDING_TIMEOUT
+
+    count = len(pending_uploads.get(chat_id, {}).get("collected", []))
+    bot.reply_to(
+        message,
+        f"✅ Photo {count} saved under *'{title}'*. Send more or /donesaving to finish.",
+        parse_mode="Markdown"
+    )
+
 
 # ==========================================
-# 27B. /deleteupload (scoped to this chat)
+# 27B. /donesaving — close the upload session
+# ==========================================
+@bot.message_handler(commands=['donesaving'])
+def handle_done_saving(message):
+    chat_id = message.chat.id
+    pending = get_pending(chat_id)
+    if not pending:
+        bot.reply_to(message, "⚠️ No active upload session. Start one with /upload [title]")
+        return
+
+    count = len(pending["collected"])
+    title = pending["title"]
+    clear_pending(chat_id)
+    bot.reply_to(
+        message,
+        f"✅ Done! Saved {count} photo(s) under *'{title}'*.\n"
+        f"Type *show me {title}* anytime to view them.",
+        parse_mode="Markdown"
+    )
+
+
+# ==========================================
+# 27C. /deleteupload — remove saved uploads
 # ==========================================
 @bot.message_handler(commands=['deleteupload'])
 def delete_upload(message):
@@ -1312,34 +1382,37 @@ def delete_upload(message):
         bot.reply_to(
             message,
             "⚠️ Provide a keyword or ID.\n"
-            "Examples:\n"
-            "• /deleteupload math — by title keyword\n"
+            "• /deleteupload math — by title\n"
             "• /deleteupload id:1234567890 — by ID\n"
-            "• /deleteupload all — wipe all uploads in this chat"
+            "• /deleteupload all — wipe all in this chat"
         )
         return
+
     db = load_db()
     chat_id = message.chat.id
-    original_count = len(get_chat_notes(db, chat_id))
+
     if query.lower() == "all":
+        count = sum(1 for n in db.get("notes", []) if n.get("chat_id") == chat_id)
         db["notes"] = [n for n in db.get("notes", []) if n.get("chat_id") != chat_id]
         save_db(db)
-        bot.reply_to(message, f"🗑️ Cleared all {original_count} upload(s) for this chat.")
+        bot.reply_to(message, f"🗑️ Cleared {count} upload(s) for this chat.")
         return
+
     id_match = re.match(r'id:(\d+)', query, re.IGNORECASE)
     if id_match:
         target_id = int(id_match.group(1))
         before = len(db["notes"])
-        db["notes"] = [n for n in db["notes"] if not (n.get("id") == target_id and n.get("chat_id") == chat_id)]
+        db["notes"] = [n for n in db["notes"]
+                       if not (n.get("id") == target_id and n.get("chat_id") == chat_id)]
         deleted = before - len(db["notes"])
         save_db(db)
-        if deleted:
-            bot.reply_to(message, f"🗑️ Deleted upload with ID {target_id}.")
-        else:
-            bot.reply_to(message, f"🚫 No upload found with ID {target_id} in this chat.")
+        msg = f"🗑️ Deleted upload ID {target_id}." if deleted else f"🚫 No upload with ID {target_id} in this chat."
+        bot.reply_to(message, msg)
         return
+
     before = len(db.get("notes", []))
-    db["notes"] = [n for n in db.get("notes", []) if not (n.get("chat_id") == chat_id and query.lower() in n.get("title", "").lower())]
+    db["notes"] = [n for n in db.get("notes", [])
+                   if not (n.get("chat_id") == chat_id and query.lower() in n.get("title", "").lower())]
     deleted = before - len(db["notes"])
     if deleted:
         save_db(db)
@@ -1347,19 +1420,55 @@ def delete_upload(message):
     else:
         bot.reply_to(message, f"🚫 No uploads found matching '{query}'.")
 
+
 # ==========================================
-# 27C. /uploads — list uploads saved in this chat
+# 27D. /uploads — list all saved uploads
 # ==========================================
 @bot.message_handler(commands=['uploads'])
 def list_uploads(message):
     db = load_db()
     items = get_chat_notes(db, message.chat.id)
     if not items:
-        bot.reply_to(message, "📎 No uploads saved in this chat yet.\nTry: caption a photo with '/upload math'")
+        bot.reply_to(message, "📎 No uploads yet. Use /upload [title] to start.")
         return
     type_emoji = {"photo": "🖼️", "file": "📄", "text": "📝"}
-    lines = [f"{type_emoji.get(n['type'],'📎')} [ID:{n['id']}] {n['title']}" for n in items]
-    bot.reply_to(message, "📎 Uploads in this chat\n\n" + "\n".join(lines))
+    lines = [f"{type_emoji.get(n['type'], '📎')} [ID:{n['id']}] {n['title']}" for n in items]
+    bot.reply_to(message, "📎 Your uploads:\n\n" + "\n".join(lines))
+
+
+# ==========================================
+# 27E. Free-text retrieval — "show me math"
+# ==========================================
+@bot.message_handler(func=lambda m: bool(
+    m.text and re.search(r'(?:show me|show|get|find|give me)\s+(.+)', m.text.strip(), re.IGNORECASE)
+))
+def handle_show_request(message):
+    match = re.search(
+        r'(?:show me|show|get|find|give me)\s+(.+)', message.text.strip(), re.IGNORECASE
+    )
+    if not match:
+        return
+
+    keyword = match.group(1).lower().strip()
+    db = load_db()
+    chat_id = message.chat.id
+    matches = [n for n in get_chat_notes(db, chat_id) if keyword in n.get("title", "").lower()]
+
+    if not matches:
+        bot.reply_to(message, f"🔍 No uploads found matching *'{keyword}'*.", parse_mode="Markdown")
+        return
+
+    bot.reply_to(message, f"📎 Found {len(matches)} item(s) for *'{keyword}'*:", parse_mode="Markdown")
+    for note in matches:
+        try:
+            if note["type"] == "photo":
+                bot.send_photo(chat_id, note["file_id"], caption=f"🖼️ {note['title']}")
+            elif note["type"] == "file":
+                bot.send_document(chat_id, note["file_id"], caption=f"📄 {note['title']}")
+            elif note["type"] == "text":
+                bot.send_message(chat_id, f"📝 *{note['title']}*\n\n{note['content']}", parse_mode="Markdown")
+        except Exception as e:
+            bot.send_message(chat_id, f"⚠️ Couldn't retrieve item ID {note['id']}: {e}")
 
 # ==========================================
 # 28. /help
@@ -1370,6 +1479,7 @@ def show_help(message):
         "📖 COMMAND REFERENCE\n\n"
         "ONE-TIME SCHEDULES\n"
         "• -sched [task] [date] [time]\n"
+        "• /upload, /donesaving, /deleteupload, /uploads (commands)\n"
         "• Multiple lines in one message are all saved (bulk paste)\n"
         "• -update \"task\" -> date: 2026-06-26\n"
         "• -update \"task\" -> time: 7:00 PM\n"
